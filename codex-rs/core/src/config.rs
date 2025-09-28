@@ -22,12 +22,15 @@ use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
+use crate::sensitive_paths::SensitivePathConfig;
+use crate::sensitive_paths::SensitivePathsToml;
 use anyhow::Context;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 use codex_protocol::config_types::Verbosity;
 use dirs::home_dir;
 use serde::Deserialize;
@@ -85,6 +88,8 @@ pub struct Config {
     pub sandbox_policy: SandboxPolicy,
 
     pub shell_environment_policy: ShellEnvironmentPolicy,
+    pub sensitive_path_config: SensitivePathConfig,
+    pub sensitive_path_precheck_mode: SensitivePathPrecheckMode,
 
     /// When `true`, `AgentReasoning` events emitted by the backend will be
     /// suppressed from the frontend output. This can reduce visual noise when
@@ -646,6 +651,8 @@ pub struct ConfigToml {
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
 
+    pub sensitive_path_precheck_mode: Option<SensitivePathPrecheckMode>,
+
     #[serde(default)]
     pub shell_environment_policy: ShellEnvironmentPolicyToml,
 
@@ -654,6 +661,9 @@ pub struct ConfigToml {
 
     /// Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
     pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+
+    #[serde(default)]
+    pub sensitive_paths: Option<SensitivePathsToml>,
 
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
@@ -747,6 +757,7 @@ impl From<ConfigToml> for UserSavedConfig {
 
         Self {
             approval_policy: config_toml.approval_policy,
+            sensitive_path_precheck_mode: config_toml.sensitive_path_precheck_mode,
             sandbox_mode: config_toml.sandbox_mode,
             sandbox_settings: config_toml.sandbox_workspace_write.map(From::from),
             model: config_toml.model,
@@ -946,6 +957,11 @@ impl Config {
             .clone();
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
+        let sensitive_path_config = SensitivePathConfig::from_toml(cfg.sensitive_paths.clone());
+        let sensitive_path_precheck_mode = config_profile
+            .sensitive_path_precheck_mode
+            .or(cfg.sensitive_path_precheck_mode)
+            .unwrap_or_default();
 
         let resolved_cwd = {
             use std::env;
@@ -1038,6 +1054,8 @@ impl Config {
                 .unwrap_or_else(AskForApproval::default),
             sandbox_policy,
             shell_environment_policy,
+            sensitive_path_config,
+            sensitive_path_precheck_mode,
             notify: cfg.notify,
             user_instructions,
             base_instructions,
@@ -1824,6 +1842,8 @@ model_verbosity = "high"
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
+                sensitive_path_config: SensitivePathConfig::default(),
+                sensitive_path_precheck_mode: SensitivePathPrecheckMode::Ask,
                 user_instructions: None,
                 notify: None,
                 cwd: fixture.cwd(),
@@ -1885,6 +1905,8 @@ model_verbosity = "high"
             approval_policy: AskForApproval::UnlessTrusted,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             shell_environment_policy: ShellEnvironmentPolicy::default(),
+            sensitive_path_config: SensitivePathConfig::default(),
+            sensitive_path_precheck_mode: SensitivePathPrecheckMode::Ask,
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),
@@ -1961,6 +1983,8 @@ model_verbosity = "high"
             approval_policy: AskForApproval::OnFailure,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             shell_environment_policy: ShellEnvironmentPolicy::default(),
+            sensitive_path_config: SensitivePathConfig::default(),
+            sensitive_path_precheck_mode: SensitivePathPrecheckMode::Ask,
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),
@@ -2023,6 +2047,8 @@ model_verbosity = "high"
             approval_policy: AskForApproval::OnFailure,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             shell_environment_policy: ShellEnvironmentPolicy::default(),
+            sensitive_path_config: SensitivePathConfig::default(),
+            sensitive_path_precheck_mode: SensitivePathPrecheckMode::Ask,
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),

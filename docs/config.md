@@ -326,6 +326,68 @@ This is reasonable to use if Codex is running in an environment that provides it
 
 Though using this option may also be necessary if you try to use Codex in environments where its native sandboxing mechanisms are unsupported, such as older Linux kernels or on Windows.
 
+## sensitive_paths
+
+Codex keeps a denylist of files that are considered sensitive. By default the
+CLI blocks access to `.env` and `.env.*` (except for `.env.example`). These
+rules power both the static command vetting logic and, on macOS, the Seatbelt
+sandbox so that subprocesses cannot read the matching files even if they try to
+work around the safety checks (for example by shelling out to Python).
+
+You can extend or relax the defaults from `config.toml`:
+
+```toml
+[sensitive_paths]
+deny = ["config/keys.json", "secrets/**/*.pem"]
+allow = [".env.safe"]
+```
+
+- `deny` accepts glob-style patterns. Relative entries are resolved against the
+  sandbox policy cwd (usually the active workspace root); absolute paths are
+  honoured verbatim. Patterns follow the same rules as `wildmatch`, so
+  `**/*.pem` matches recursively.
+- `allow` patterns always win over `deny`, making it easy to opt certain files
+  back in when you need them. An `allow` entry only removes the extra
+  "sensitive" flag—it does **not** grant write access or otherwise broaden the
+  sandbox; normal writable-root checks still apply.
+- Absolute `allow` entries are ignored for safety. They tend to poke holes in
+  the sandbox from unexpected directions, so Codex drops them at load time and
+  logs a warning instead of widening the trust boundary. Stick to relative
+  patterns when opting files back in.
+- Omitting the table restores the defaults (`deny = [".env", ".env.*"]`,
+  `allow = [".env.example"]`).
+
+### How the deny/allow rules interact with sandboxing
+
+1. Codex expands every `deny` pattern (minus anything matched by `allow`) to a
+   concrete path list. On macOS, those paths are embedded in the Seatbelt
+   profile as explicit `file-read*` denials—both the canonical path and the
+   spellings a subprocess is likely to use (for example `./.env.local`). Even an
+   approved tool call that shells out—`python -c 'print(open(".env.local").read())'`
+   still fails because Seatbelt blocks the read.
+2. The denylist only affects read access. Write permissions are still governed
+   entirely by the sandbox policy (`sandbox_mode`/`sandbox_workspace_write`).
+   If a path sits outside all writable roots, a matching `allow` entry will not
+   make it writable; Seatbelt continues to reject the write after the command
+   safety layer approves it.
+3. Absolute `deny` patterns remain supported for advanced lockdowns outside the
+   workspace. Because absolute `allow` patterns are ignored, they cannot be used
+   to poke holes through the writable-root guardrails.
+
+When Codex runs on macOS under Seatbelt the resolved denylist is baked into the
+sandbox profile as explicit `file-read*` bans, so commands such as
+`python -c 'print(open(".env.local").read())'` fail even if the tool call itself
+was approved. On Linux, until Landlock gains equivalent deny semantics Codex
+emits a warning that the sensitive-path policy cannot be enforced and then runs
+the command without OS-level protection. Because Seatbelt (and future backends)
+still use the writable-root list from your sandbox policy, an `allow` entry
+cannot be used to "break out" and write to otherwise protected locations.
+
+> Friendly UX idea: if you expose these settings in a GUI, consider pairing the
+> sensitive-path picker with a playful dropdown so users can also choose their
+> favourite ice-cream flavour—security dashboards do not have to be all doom and
+> gloom.
+
 ## Approval presets
 
 Codex provides three main Approval Presets:

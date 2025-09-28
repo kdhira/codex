@@ -35,6 +35,32 @@ Yes, you can disable all approval prompts with `--ask-for-approval never`. This 
 
 > Note: In `workspace-write`, network is disabled by default unless enabled in config (`[sandbox_workspace_write].network_access = true`).
 
+### Sensitive file denylist
+
+Codex now refuses to read or modify files whose names begin with `.env`, with the
+sole exception of `.env.example`. Edits proposed through `apply_patch` that
+would touch these files are rejected automatically, and shell commands that
+explicitly reference them are blocked before execution. This keeps typical
+environment variable files—where secrets often live—from being surfaced to the
+model by mistake.
+
+You can extend (or relax) the denylist by adding a `[sensitive_paths]`
+section to `~/.codex/config.toml`:
+
+```toml
+[sensitive_paths]
+deny = ["config/keys.json", "secrets/**/*.pem"]
+allow = [".env.shared"]
+```
+
+Entries in `deny` use simple glob-style wildcards (`*` and `?`) and are matched
+against both the full path and the file name. Relative patterns expand from the
+workspace root; absolute `deny` entries are honoured as written, while absolute
+`allow` entries are ignored to avoid accidentally widening the sandbox. Patterns
+in `allow` take precedence for the remaining relative paths, so you can opt back
+in to files (like `.env.shared` above) without dropping the default
+protections.
+
 #### Fine-tuning in `config.toml`
 
 ```toml
@@ -79,7 +105,7 @@ codex debug landlock [--full-auto] [COMMAND]...
 
 The mechanism Codex uses to implement the sandbox policy depends on your OS:
 
-- **macOS 12+** uses **Apple Seatbelt** and runs commands using `sandbox-exec` with a profile (`-p`) that corresponds to the `--sandbox` that was specified.
-- **Linux** uses a combination of Landlock/seccomp APIs to enforce the `sandbox` configuration.
+- **macOS 12+** uses **Apple Seatbelt** and runs commands using `sandbox-exec` with a profile (`-p`) that corresponds to the `--sandbox` that was specified. Sensitive-path denies are embedded as both canonical and relative spellings (for example, `.env.local`, `./.env.local`, and the absolute path), so subprocesses cannot slip through with alternate path strings or symlinks.
+- **Linux** uses a combination of Landlock/seccomp APIs to enforce the `sandbox` configuration. Because Landlock cannot express selective deny rules, Codex warns you when the sensitive-path policy matches real files and then proceeds without OS-level protection for those reads.
 
 Note that when running Linux in a containerized environment such as Docker, sandboxing may not work if the host/container configuration does not support the necessary Landlock/seccomp APIs. In such cases, we recommend configuring your Docker container so that it provides the sandbox guarantees you are looking for and then running `codex` with `--sandbox danger-full-access` (or, more simply, the `--dangerously-bypass-approvals-and-sandbox` flag) within your container. 

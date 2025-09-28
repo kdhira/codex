@@ -12,6 +12,7 @@ use crate::client_common::REVIEW_PROMPT;
 use crate::event_mapping::map_response_item_to_event_messages;
 use crate::function_tool::FunctionCallError;
 use crate::review_format::format_review_findings_block;
+use crate::sensitive_paths::SensitivePathConfig;
 use crate::terminal;
 use crate::user_notification::UserNotifier;
 use async_channel::Receiver;
@@ -20,6 +21,7 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_protocol::ConversationId;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ReviewRequest;
@@ -288,6 +290,8 @@ pub(crate) struct TurnContext {
     pub(crate) approval_policy: AskForApproval,
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
+    pub(crate) sensitive_path_config: SensitivePathConfig,
+    pub(crate) sensitive_path_precheck_mode: SensitivePathPrecheckMode,
     pub(crate) tools_config: ToolsConfig,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
@@ -485,6 +489,8 @@ impl Session {
             approval_policy,
             sandbox_policy,
             shell_environment_policy: config.shell_environment_policy.clone(),
+            sensitive_path_config: config.sensitive_path_config.clone(),
+            sensitive_path_precheck_mode: config.sensitive_path_precheck_mode,
             cwd,
             is_review_mode: false,
             final_output_json_schema: None,
@@ -955,6 +961,7 @@ impl Session {
             exec_args.sandbox_type,
             exec_args.sandbox_policy,
             exec_args.sandbox_cwd,
+            exec_args.sensitive_paths,
             exec_args.codex_linux_sandbox_exe,
             exec_args.stdout_stream,
         )
@@ -1198,6 +1205,8 @@ async fn submission_loop(
                     approval_policy: new_approval_policy,
                     sandbox_policy: new_sandbox_policy.clone(),
                     shell_environment_policy: prev.shell_environment_policy.clone(),
+                    sensitive_path_config: prev.sensitive_path_config.clone(),
+                    sensitive_path_precheck_mode: prev.sensitive_path_precheck_mode,
                     cwd: new_cwd.clone(),
                     is_review_mode: false,
                     final_output_json_schema: None,
@@ -1298,6 +1307,8 @@ async fn submission_loop(
                         approval_policy,
                         sandbox_policy,
                         shell_environment_policy: turn_context.shell_environment_policy.clone(),
+                        sensitive_path_config: turn_context.sensitive_path_config.clone(),
+                        sensitive_path_precheck_mode: turn_context.sensitive_path_precheck_mode,
                         cwd,
                         is_review_mode: false,
                         final_output_json_schema,
@@ -1557,6 +1568,8 @@ async fn spawn_review_thread(
         approval_policy: parent_turn_context.approval_policy,
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
+        sensitive_path_config: parent_turn_context.sensitive_path_config.clone(),
+        sensitive_path_precheck_mode: parent_turn_context.sensitive_path_precheck_mode,
         cwd: parent_turn_context.cwd.clone(),
         is_review_mode: true,
         final_output_json_schema: None,
@@ -2632,6 +2645,7 @@ pub struct ExecInvokeArgs<'a> {
     pub sandbox_type: SandboxType,
     pub sandbox_policy: &'a SandboxPolicy,
     pub sandbox_cwd: &'a Path,
+    pub sensitive_paths: &'a crate::sensitive_paths::SensitivePathConfig,
     pub codex_linux_sandbox_exe: &'a Option<PathBuf>,
     pub stdout_stream: Option<StdoutStream>,
 }
@@ -2752,6 +2766,8 @@ async fn handle_container_exec_with_params(
                     &turn_context.sandbox_policy,
                     state.approved_commands_ref(),
                     params.with_escalated_permissions.unwrap_or(false),
+                    &turn_context.sensitive_path_config,
+                    turn_context.sensitive_path_precheck_mode,
                 )
             };
             let command_for_display = params.command.clone();
@@ -2777,14 +2793,20 @@ async fn handle_container_exec_with_params(
 
             sandbox_type
         }
-        SafetyCheck::AskUser => {
+        SafetyCheck::AskUser { reason } => {
+            let combined_reason = match (params.justification.clone(), reason) {
+                (Some(existing), Some(extra)) => Some(format!("{existing}\n\n{extra}")),
+                (None, Some(extra)) => Some(extra),
+                (Some(existing), None) => Some(existing),
+                (None, None) => None,
+            };
             let decision = sess
                 .request_command_approval(
                     sub_id.clone(),
                     call_id.clone(),
                     params.command.clone(),
                     params.cwd.clone(),
-                    params.justification.clone(),
+                    combined_reason,
                 )
                 .await;
             match decision {
@@ -2873,6 +2895,7 @@ async fn handle_container_exec_with_params(
                 sandbox_type,
                 sandbox_policy: &turn_context.sandbox_policy,
                 sandbox_cwd: &turn_context.cwd,
+                sensitive_paths: &turn_context.sensitive_path_config,
                 codex_linux_sandbox_exe: &sess.services.codex_linux_sandbox_exe,
                 stdout_stream: if exec_command_context.apply_patch.is_some() {
                     None
@@ -3000,6 +3023,7 @@ async fn handle_sandbox_error(
                         sandbox_type: SandboxType::None,
                         sandbox_policy: &turn_context.sandbox_policy,
                         sandbox_cwd: &turn_context.cwd,
+                        sensitive_paths: &turn_context.sensitive_path_config,
                         codex_linux_sandbox_exe: &sess.services.codex_linux_sandbox_exe,
                         stdout_stream: if exec_command_context.apply_patch.is_some() {
                             None
@@ -3606,6 +3630,8 @@ mod tests {
             approval_policy: config.approval_policy,
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
+            sensitive_path_config: config.sensitive_path_config.clone(),
+            sensitive_path_precheck_mode: config.sensitive_path_precheck_mode,
             tools_config,
             is_review_mode: false,
             final_output_json_schema: None,
@@ -3675,6 +3701,8 @@ mod tests {
             approval_policy: config.approval_policy,
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
+            sensitive_path_config: config.sensitive_path_config.clone(),
+            sensitive_path_precheck_mode: config.sensitive_path_precheck_mode,
             tools_config,
             is_review_mode: false,
             final_output_json_schema: None,

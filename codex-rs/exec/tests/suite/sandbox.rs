@@ -1,5 +1,6 @@
 #![cfg(unix)]
 use codex_core::protocol::SandboxPolicy;
+use codex_core::sensitive_paths::SensitivePathConfig;
 use codex_core::spawn::StdioPolicy;
 use std::collections::HashMap;
 use std::future::Future;
@@ -25,6 +26,7 @@ async fn spawn_command_under_sandbox(
         command_cwd,
         sandbox_policy,
         sandbox_cwd,
+        &SensitivePathConfig::default(),
         stdio_policy,
         env,
     )

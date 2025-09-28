@@ -93,6 +93,7 @@ async fn run_command_under_sandbox(
                 cwd,
                 &config.sandbox_policy,
                 sandbox_policy_cwd.as_path(),
+                &config.sensitive_path_config,
                 stdio_policy,
                 env,
             )

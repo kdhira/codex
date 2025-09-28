@@ -620,6 +620,7 @@ impl CodexMessageProcessor {
         let outgoing = self.outgoing.clone();
         let req_id = request_id;
         let sandbox_cwd = self.config.cwd.clone();
+        let sensitive_paths = self.config.sensitive_path_config.clone();
 
         tokio::spawn(async move {
             match codex_core::exec::process_exec_tool_call(
@@ -627,6 +628,7 @@ impl CodexMessageProcessor {
                 sandbox_type,
                 &effective_policy,
                 sandbox_cwd.as_path(),
+                &sensitive_paths,
                 &codex_linux_sandbox_exe,
                 None,
             )

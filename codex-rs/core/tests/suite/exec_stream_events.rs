@@ -16,6 +16,7 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandOutputDeltaEvent;
 use codex_core::protocol::ExecOutputStream;
 use codex_core::protocol::SandboxPolicy;
+use codex_core::sensitive_paths::SensitivePathConfig;
 
 fn collect_stdout_events(rx: Receiver<Event>) -> Vec<u8> {
     let mut out = Vec::new();
@@ -66,6 +67,7 @@ async fn test_exec_stdout_stream_events_echo() {
         SandboxType::None,
         &policy,
         cwd.as_path(),
+        &SensitivePathConfig::default(),
         &None,
         Some(stdout_stream),
     )
@@ -118,6 +120,7 @@ async fn test_exec_stderr_stream_events_echo() {
         SandboxType::None,
         &policy,
         cwd.as_path(),
+        &SensitivePathConfig::default(),
         &None,
         Some(stdout_stream),
     )
@@ -173,6 +176,7 @@ async fn test_aggregated_output_interleaves_in_order() {
         SandboxType::None,
         &policy,
         cwd.as_path(),
+        &SensitivePathConfig::default(),
         &None,
         None,
     )
@@ -211,6 +215,7 @@ async fn test_exec_timeout_returns_partial_output() {
         SandboxType::None,
         &policy,
         cwd.as_path(),
+        &SensitivePathConfig::default(),
         &None,
         None,
     )

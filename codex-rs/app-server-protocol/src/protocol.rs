@@ -8,6 +8,7 @@ use codex_protocol::ConversationId;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -468,6 +469,8 @@ pub struct UserSavedConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<AskForApproval>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitive_path_precheck_mode: Option<SensitivePathPrecheckMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<SandboxMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_settings: Option<SandboxSettings>,
@@ -502,6 +505,7 @@ pub struct Profile {
     /// [`ModelProviderInfo`] to use.
     pub model_provider: Option<String>,
     pub approval_policy: Option<AskForApproval>,
+    pub sensitive_path_precheck_mode: Option<SensitivePathPrecheckMode>,
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,

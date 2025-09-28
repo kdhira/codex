@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use codex_core::protocol::SandboxPolicy;
 use codex_core::seatbelt::spawn_command_under_seatbelt;
+use codex_core::sensitive_paths::SensitivePathConfig;
 use codex_core::spawn::CODEX_SANDBOX_ENV_VAR;
 use codex_core::spawn::StdioPolicy;
 use tempfile::TempDir;
@@ -184,6 +185,7 @@ async fn python_getpwuid_works_under_seatbelt() {
         command_cwd,
         &policy,
         sandbox_cwd.as_path(),
+        &SensitivePathConfig::default(),
         StdioPolicy::RedirectForShellTool,
         HashMap::new(),
     )
@@ -195,6 +197,67 @@ async fn python_getpwuid_works_under_seatbelt() {
         .await
         .expect("should be able to wait for child process");
     assert!(status.success(), "python exited with {status:?}");
+}
+
+#[tokio::test]
+async fn seatbelt_blocks_sensitive_env_files() {
+    if std::env::var(CODEX_SANDBOX_ENV_VAR) == Ok("seatbelt".to_string()) {
+        eprintln!("{CODEX_SANDBOX_ENV_VAR} is set to 'seatbelt', skipping test.");
+        return;
+    }
+
+    let tmp = TempDir::new().expect("should be able to create temp dir");
+    let sandbox_cwd = tmp.path().join("workspace");
+    std::fs::create_dir_all(&sandbox_cwd).expect("create workspace dir");
+
+    let allowed_file = sandbox_cwd.join(".env.example");
+    let denied_file = sandbox_cwd.join(".env.local");
+    std::fs::write(&allowed_file, "example").expect("create .env.example");
+    std::fs::write(&denied_file, "secret").expect("create .env.local");
+
+    let policy = SandboxPolicy::ReadOnly;
+
+    let mut allowed_child = spawn_command_under_seatbelt(
+        vec![
+            "/bin/cat".to_string(),
+            allowed_file.to_string_lossy().into_owned(),
+        ],
+        sandbox_cwd.clone(),
+        &policy,
+        sandbox_cwd.as_path(),
+        &SensitivePathConfig::default(),
+        StdioPolicy::RedirectForShellTool,
+        HashMap::new(),
+    )
+    .await
+    .expect("should spawn cat for allowed file");
+
+    let allowed_status = allowed_child.wait().await.expect("wait allowed cat");
+    assert!(
+        allowed_status.success(),
+        "seatbelt unexpectedly blocked allowed file: {allowed_status:?}"
+    );
+
+    let mut denied_child = spawn_command_under_seatbelt(
+        vec![
+            "/bin/cat".to_string(),
+            denied_file.to_string_lossy().into_owned(),
+        ],
+        sandbox_cwd.clone(),
+        &policy,
+        sandbox_cwd.as_path(),
+        &SensitivePathConfig::default(),
+        StdioPolicy::RedirectForShellTool,
+        HashMap::new(),
+    )
+    .await
+    .expect("should spawn cat for denied file");
+
+    let denied_status = denied_child.wait().await.expect("wait denied cat");
+    assert!(
+        !denied_status.success(),
+        "seatbelt allowed reading sensitive file: {denied_status:?}"
+    );
 }
 
 #[expect(clippy::expect_used)]
@@ -229,6 +292,7 @@ async fn touch(path: &Path, policy: &SandboxPolicy) -> bool {
         command_cwd,
         policy,
         sandbox_cwd.as_path(),
+        &SensitivePathConfig::default(),
         StdioPolicy::RedirectForShellTool,
         HashMap::new(),
     )

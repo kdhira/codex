@@ -59,3 +59,15 @@ pub enum SandboxMode {
     #[serde(rename = "danger-full-access")]
     DangerFullAccess,
 }
+
+#[derive(
+    Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Display, TS, EnumIter,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum SensitivePathPrecheckMode {
+    #[default]
+    Ask,
+    Block,
+    Off,
+}

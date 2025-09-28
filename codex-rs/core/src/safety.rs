@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 
-use crate::exec::SandboxType;
-
+use crate::bash::parse_bash_lc_plain_commands;
 use crate::command_safety::is_dangerous_command::command_might_be_dangerous;
 use crate::command_safety::is_safe_command::is_known_safe_command;
+use crate::exec::SandboxType;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
+use crate::sensitive_paths::SensitivePathConfig;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 
 #[derive(Debug, PartialEq)]
 pub enum SafetyCheck {
@@ -19,10 +21,58 @@ pub enum SafetyCheck {
         sandbox_type: SandboxType,
         user_explicitly_approved: bool,
     },
-    AskUser,
+    AskUser {
+        reason: Option<String>,
+    },
     Reject {
         reason: String,
     },
+}
+
+fn find_sensitive_path_in_patch(
+    action: &ApplyPatchAction,
+    sensitive_paths: &SensitivePathConfig,
+) -> Option<PathBuf> {
+    for (path, change) in action.changes() {
+        if sensitive_paths.is_path_sensitive(path) {
+            return Some(path.clone());
+        }
+
+        if let ApplyPatchFileChange::Update {
+            move_path: Some(dest),
+            ..
+        } = change
+            && sensitive_paths.is_path_sensitive(dest)
+        {
+            return Some(dest.clone());
+        }
+    }
+
+    None
+}
+
+fn command_targets_sensitive_path(
+    command: &[String],
+    sensitive_paths: &SensitivePathConfig,
+) -> bool {
+    if contains_sensitive_arg(command, sensitive_paths) {
+        return true;
+    }
+
+    if let Some(all_commands) = parse_bash_lc_plain_commands(command) {
+        return all_commands
+            .iter()
+            .any(|cmd| contains_sensitive_arg(cmd, sensitive_paths));
+    }
+
+    false
+}
+
+fn contains_sensitive_arg(command: &[String], sensitive_paths: &SensitivePathConfig) -> bool {
+    command
+        .iter()
+        .skip(1)
+        .any(|arg| sensitive_paths.is_candidate_sensitive(arg))
 }
 
 pub fn assess_patch_safety(
@@ -30,10 +80,17 @@ pub fn assess_patch_safety(
     policy: AskForApproval,
     sandbox_policy: &SandboxPolicy,
     cwd: &Path,
+    sensitive_paths: &SensitivePathConfig,
 ) -> SafetyCheck {
     if action.is_empty() {
         return SafetyCheck::Reject {
             reason: "empty patch".to_string(),
+        };
+    }
+
+    if let Some(_sensitive) = find_sensitive_path_in_patch(action, sensitive_paths) {
+        return SafetyCheck::Reject {
+            reason: "refusing to modify file flagged by the sensitive-path policy".to_string(),
         };
     }
 
@@ -44,7 +101,7 @@ pub fn assess_patch_safety(
         // TODO(ragona): I'm not sure this is actually correct? I believe in this case
         // we want to continue to the writable paths check before asking the user.
         AskForApproval::UnlessTrusted => {
-            return SafetyCheck::AskUser;
+            return SafetyCheck::AskUser { reason: None };
         }
     }
 
@@ -71,7 +128,7 @@ pub fn assess_patch_safety(
                     user_explicitly_approved: false,
                 }
             }
-            None => SafetyCheck::AskUser,
+            None => SafetyCheck::AskUser { reason: None },
         }
     } else if policy == AskForApproval::Never {
         SafetyCheck::Reject {
@@ -79,7 +136,7 @@ pub fn assess_patch_safety(
                 .to_string(),
         }
     } else {
-        SafetyCheck::AskUser
+        SafetyCheck::AskUser { reason: None }
     }
 }
 
@@ -95,6 +152,8 @@ pub fn assess_command_safety(
     sandbox_policy: &SandboxPolicy,
     approved: &HashSet<Vec<String>>,
     with_escalated_permissions: bool,
+    sensitive_paths: &SensitivePathConfig,
+    precheck_mode: SensitivePathPrecheckMode,
 ) -> SafetyCheck {
     // Some commands look dangerous. Even if they are run inside a sandbox,
     // unless the user has explicitly approved them, we should ask,
@@ -107,7 +166,34 @@ pub fn assess_command_safety(
             };
         }
 
-        return SafetyCheck::AskUser;
+        return SafetyCheck::AskUser { reason: None };
+    }
+
+    const BLOCK_REASON: &str = "command blocked: sensitive-path policy triggered";
+    const ASK_REASON: &str = "command references a sensitive path; approval required";
+
+    if command_targets_sensitive_path(command, sensitive_paths) {
+        match precheck_mode {
+            SensitivePathPrecheckMode::Block => {
+                return SafetyCheck::Reject {
+                    reason: BLOCK_REASON.to_string(),
+                };
+            }
+            SensitivePathPrecheckMode::Ask => {
+                if approval_policy == AskForApproval::Never {
+                    return SafetyCheck::Reject {
+                        reason: BLOCK_REASON.to_string(),
+                    };
+                }
+
+                return SafetyCheck::AskUser {
+                    reason: Some(ASK_REASON.to_string()),
+                };
+            }
+            SensitivePathPrecheckMode::Off => {
+                // Fall through to remaining safety checks.
+            }
+        }
     }
 
     // A command is "trusted" because either:
@@ -147,7 +233,7 @@ pub(crate) fn assess_safety_for_untrusted_command(
             // Even though the user may have opted into DangerFullAccess,
             // they also requested that we ask for approval for untrusted
             // commands.
-            SafetyCheck::AskUser
+            SafetyCheck::AskUser { reason: None }
         }
         (OnFailure, DangerFullAccess)
         | (Never, DangerFullAccess)
@@ -157,7 +243,7 @@ pub(crate) fn assess_safety_for_untrusted_command(
         },
         (OnRequest, ReadOnly) | (OnRequest, WorkspaceWrite { .. }) => {
             if with_escalated_permissions {
-                SafetyCheck::AskUser
+                SafetyCheck::AskUser { reason: None }
             } else {
                 match get_platform_sandbox() {
                     Some(sandbox_type) => SafetyCheck::AutoApprove {
@@ -166,7 +252,7 @@ pub(crate) fn assess_safety_for_untrusted_command(
                     },
                     // Fall back to asking since the command is untrusted and
                     // we do not have a sandbox available
-                    None => SafetyCheck::AskUser,
+                    None => SafetyCheck::AskUser { reason: None },
                 }
             }
         }
@@ -185,7 +271,7 @@ pub(crate) fn assess_safety_for_untrusted_command(
                         // user has requested to only ask for approval on
                         // failure, we will ask the user because no sandbox is
                         // available.
-                        SafetyCheck::AskUser
+                        SafetyCheck::AskUser { reason: None }
                     } else {
                         // We are in non-interactive mode and lack approval, so
                         // all we can do is reject the command.
@@ -287,7 +373,219 @@ fn is_write_patch_constrained_to_writable_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensitive_paths::SensitivePathsToml;
+    use codex_protocol::config_types::SensitivePathPrecheckMode;
     use tempfile::TempDir;
+
+    #[test]
+    fn patch_touching_env_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let policy = SandboxPolicy::new_workspace_write_policy();
+        let action = ApplyPatchAction::new_add_for_test(&cwd.join(".env"), String::new());
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_patch_safety(
+            &action,
+            AskForApproval::OnRequest,
+            &policy,
+            cwd,
+            &sensitive_paths,
+        );
+
+        assert!(matches!(decision, SafetyCheck::Reject { .. }));
+    }
+
+    #[test]
+    fn patch_touching_env_example_is_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let policy = SandboxPolicy::new_workspace_write_policy();
+        let action = ApplyPatchAction::new_add_for_test(&cwd.join(".env.example"), String::new());
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_patch_safety(
+            &action,
+            AskForApproval::OnRequest,
+            &policy,
+            cwd,
+            &sensitive_paths,
+        );
+
+        assert!(!matches!(decision, SafetyCheck::Reject { .. }));
+    }
+
+    #[test]
+    fn command_targeting_env_block_mode_is_rejected() {
+        let command = vec!["cat".to_string(), ".env".to_string()];
+        let approval_policy = AskForApproval::OnRequest;
+        let sandbox_policy = SandboxPolicy::ReadOnly;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Block,
+        );
+
+        assert!(matches!(decision, SafetyCheck::Reject { .. }));
+    }
+
+    #[test]
+    fn command_targeting_env_example_is_allowed() {
+        let command = vec!["cat".to_string(), ".env.example".to_string()];
+        let approval_policy = AskForApproval::OnRequest;
+        let sandbox_policy = SandboxPolicy::ReadOnly;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Block,
+        );
+
+        assert!(!matches!(decision, SafetyCheck::Reject { .. }));
+    }
+
+    #[test]
+    fn command_targeting_env_ask_mode_requests_approval() {
+        let command = vec!["cat".to_string(), ".env".to_string()];
+        let approval_policy = AskForApproval::OnRequest;
+        let sandbox_policy = SandboxPolicy::ReadOnly;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Ask,
+        );
+
+        match decision {
+            SafetyCheck::AskUser {
+                reason: Some(reason),
+            } => {
+                assert_eq!(
+                    reason,
+                    "command references a sensitive path; approval required"
+                );
+            }
+            other => panic!("expected AskUser with reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_targeting_env_ask_mode_respects_never_policy() {
+        let command = vec!["cat".to_string(), ".env".to_string()];
+        let approval_policy = AskForApproval::Never;
+        let sandbox_policy = SandboxPolicy::ReadOnly;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Ask,
+        );
+
+        assert_eq!(
+            decision,
+            SafetyCheck::Reject {
+                reason: "command blocked: sensitive-path policy triggered".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn command_targeting_env_off_mode_skips_precheck() {
+        let command = vec!["cat".to_string(), ".env".to_string()];
+        let approval_policy = AskForApproval::OnRequest;
+        let sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::default();
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Off,
+        );
+
+        assert_eq!(
+            decision,
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
+                user_explicitly_approved: false,
+            }
+        );
+    }
+
+    #[test]
+    fn patch_respects_custom_denylist() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let policy = SandboxPolicy::new_workspace_write_policy();
+        let action = ApplyPatchAction::new_add_for_test(&cwd.join("secrets.json"), String::new());
+        let sensitive_paths = SensitivePathConfig::from_toml(Some(SensitivePathsToml {
+            deny: vec!["**/secrets.json".to_string()],
+            allow: vec![],
+        }));
+
+        let decision = assess_patch_safety(
+            &action,
+            AskForApproval::OnRequest,
+            &policy,
+            cwd,
+            &sensitive_paths,
+        );
+
+        assert!(matches!(decision, SafetyCheck::Reject { .. }));
+    }
+
+    #[test]
+    fn command_respects_custom_allowlist() {
+        let command = vec!["cat".to_string(), ".env".to_string()];
+        let approval_policy = AskForApproval::OnRequest;
+        let sandbox_policy = SandboxPolicy::ReadOnly;
+        let approved: HashSet<Vec<String>> = HashSet::new();
+        let sensitive_paths = SensitivePathConfig::from_toml(Some(SensitivePathsToml {
+            deny: vec![],
+            allow: vec![".env".to_string()],
+        }));
+
+        let decision = assess_command_safety(
+            &command,
+            approval_policy,
+            &sandbox_policy,
+            &approved,
+            false,
+            &sensitive_paths,
+            SensitivePathPrecheckMode::Block,
+        );
+
+        assert!(!matches!(decision, SafetyCheck::Reject { .. }));
+    }
 
     #[test]
     fn test_writable_roots_constraint() {
@@ -354,9 +652,11 @@ mod tests {
             &sandbox_policy,
             &approved,
             request_escalated_privileges,
+            &SensitivePathConfig::default(),
+            SensitivePathPrecheckMode::Off,
         );
 
-        assert_eq!(safety_check, SafetyCheck::AskUser);
+        assert_eq!(safety_check, SafetyCheck::AskUser { reason: None });
     }
 
     #[test]
@@ -374,6 +674,8 @@ mod tests {
             &sandbox_policy,
             &approved,
             request_escalated_privileges,
+            &SensitivePathConfig::default(),
+            SensitivePathPrecheckMode::Off,
         );
 
         assert_eq!(
@@ -399,6 +701,8 @@ mod tests {
             &sandbox_policy,
             &approved,
             request_escalated_privileges,
+            &SensitivePathConfig::default(),
+            SensitivePathPrecheckMode::Off,
         );
 
         assert_eq!(
@@ -424,6 +728,8 @@ mod tests {
             &sandbox_policy,
             &approved,
             request_escalated_privileges,
+            &SensitivePathConfig::default(),
+            SensitivePathPrecheckMode::Off,
         );
 
         let expected = match get_platform_sandbox() {
@@ -431,7 +737,7 @@ mod tests {
                 sandbox_type,
                 user_explicitly_approved: false,
             },
-            None => SafetyCheck::AskUser,
+            None => SafetyCheck::AskUser { reason: None },
         };
         assert_eq!(safety_check, expected);
     }

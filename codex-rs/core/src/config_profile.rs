@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::protocol::AskForApproval;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 use codex_protocol::config_types::Verbosity;
 
 /// Collection of common configuration options that a user can define as a unit
@@ -20,6 +21,7 @@ pub struct ConfigProfile {
     pub model_verbosity: Option<Verbosity>,
     pub chatgpt_base_url: Option<String>,
     pub experimental_instructions_file: Option<PathBuf>,
+    pub sensitive_path_precheck_mode: Option<SensitivePathPrecheckMode>,
 }
 
 impl From<ConfigProfile> for codex_app_server_protocol::Profile {
@@ -32,6 +34,7 @@ impl From<ConfigProfile> for codex_app_server_protocol::Profile {
             model_reasoning_summary: config_profile.model_reasoning_summary,
             model_verbosity: config_profile.model_verbosity,
             chatgpt_base_url: config_profile.chatgpt_base_url,
+            sensitive_path_precheck_mode: config_profile.sensitive_path_precheck_mode,
         }
     }
 }

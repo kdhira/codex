@@ -84,12 +84,15 @@ pub async fn process_exec_tool_call(
     sandbox_type: SandboxType,
     sandbox_policy: &SandboxPolicy,
     sandbox_cwd: &Path,
+    sensitive_paths: &crate::sensitive_paths::SensitivePathConfig,
     codex_linux_sandbox_exe: &Option<PathBuf>,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
     let start = Instant::now();
 
     let timeout_duration = params.timeout_duration();
+
+    let mut linux_sensitive_warning: Option<String> = None;
 
     let raw_output_result: std::result::Result<RawExecToolCallOutput, CodexErr> = match sandbox_type
     {
@@ -106,6 +109,7 @@ pub async fn process_exec_tool_call(
                 command_cwd,
                 sandbox_policy,
                 sandbox_cwd,
+                sensitive_paths,
                 StdioPolicy::RedirectForShellTool,
                 env,
             )
@@ -119,6 +123,37 @@ pub async fn process_exec_tool_call(
                 env,
                 ..
             } = params;
+
+            let resolved_sensitive = sensitive_paths.resolve_paths(sandbox_cwd);
+            if !resolved_sensitive.is_empty() {
+                // TODO(landlock-sensitive-paths): Re-enable strict enforcement once Landlock (or
+                // an alternative sandbox) can express selective deny rules.
+                // return Err(CodexErr::UnsupportedOperation(
+                //     "Sensitive-path enforcement is not yet available for the Linux sandbox; refusing to run command that could expose protected files.".to_string(),
+                // ));
+                let warning = format!(
+                    "⚠️  Sensitive-path policy matched {} path(s), but the Linux sandbox cannot block reads. Continuing without OS-level protection.\n",
+                    resolved_sensitive.len()
+                );
+                tracing::warn!(
+                    ?resolved_sensitive,
+                    "Sensitive-path policy configured, but Linux Landlock cannot deny specific files; proceeding without OS-level enforcement"
+                );
+                if let Some(stream) = stdout_stream.clone() {
+                    let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                        call_id: stream.call_id.clone(),
+                        stream: ExecOutputStream::Stderr,
+                        chunk: warning.as_bytes().to_vec(),
+                    });
+                    let event = Event {
+                        id: stream.sub_id.clone(),
+                        msg,
+                    };
+                    #[allow(clippy::let_unit_value)]
+                    let _ = stream.tx_event.send(event).await;
+                }
+                linux_sensitive_warning = Some(warning);
+            }
 
             let codex_linux_sandbox_exe = codex_linux_sandbox_exe
                 .as_ref()
@@ -160,8 +195,14 @@ pub async fn process_exec_tool_call(
             }
 
             let stdout = raw_output.stdout.from_utf8_lossy();
-            let stderr = raw_output.stderr.from_utf8_lossy();
-            let aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
+            let mut stderr = raw_output.stderr.from_utf8_lossy();
+            let mut aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
+
+            if let Some(warning) = linux_sensitive_warning {
+                stderr.text = format!("{warning}{}", stderr.text);
+                aggregated_output.text = format!("{warning}{}", aggregated_output.text);
+            }
+
             let exec_output = ExecToolCallOutput {
                 exit_code,
                 stdout,

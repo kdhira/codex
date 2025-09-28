@@ -351,6 +351,7 @@ mod tests {
                 SandboxType::None,
                 &SandboxPolicy::DangerFullAccess,
                 temp_home.path(),
+                &crate::sensitive_paths::SensitivePathConfig::default(),
                 &None,
                 None,
             )
@@ -459,6 +460,7 @@ mod macos_tests {
                 SandboxType::None,
                 &SandboxPolicy::DangerFullAccess,
                 temp_home.path(),
+                &crate::sensitive_paths::SensitivePathConfig::default(),
                 &None,
                 None,
             )

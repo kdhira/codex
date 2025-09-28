@@ -14,6 +14,7 @@ use codex_core::protocol::AskForApproval;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::SensitivePathPrecheckMode;
 use codex_protocol::config_types::Verbosity;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -28,6 +29,7 @@ fn create_config_toml(codex_home: &Path) -> std::io::Result<()> {
         r#"
 model = "gpt-5-codex"
 approval_policy = "on-request"
+sensitive_path_precheck_mode = "block"
 sandbox_mode = "workspace-write"
 model_reasoning_summary = "detailed"
 model_reasoning_effort = "high"
@@ -47,6 +49,7 @@ view_image = true
 [profiles.test]
 model = "gpt-4o"
 approval_policy = "on-request"
+sensitive_path_precheck_mode = "off"
 model_reasoning_effort = "high"
 model_reasoning_summary = "detailed"
 model_verbosity = "medium"
@@ -85,6 +88,7 @@ async fn get_config_toml_parses_all_fields() {
     let expected = GetUserSavedConfigResponse {
         config: UserSavedConfig {
             approval_policy: Some(AskForApproval::OnRequest),
+            sensitive_path_precheck_mode: Some(SensitivePathPrecheckMode::Block),
             sandbox_mode: Some(SandboxMode::WorkspaceWrite),
             sandbox_settings: Some(SandboxSettings {
                 writable_roots: vec!["/tmp".into()],
@@ -106,6 +110,7 @@ async fn get_config_toml_parses_all_fields() {
                 Profile {
                     model: Some("gpt-4o".into()),
                     approval_policy: Some(AskForApproval::OnRequest),
+                    sensitive_path_precheck_mode: Some(SensitivePathPrecheckMode::Off),
                     model_reasoning_effort: Some(ReasoningEffort::High),
                     model_reasoning_summary: Some(ReasoningSummary::Detailed),
                     model_verbosity: Some(Verbosity::Medium),
@@ -147,6 +152,7 @@ async fn get_config_toml_empty() {
     let expected = GetUserSavedConfigResponse {
         config: UserSavedConfig {
             approval_policy: None,
+            sensitive_path_precheck_mode: None,
             sandbox_mode: None,
             sandbox_settings: None,
             model: None,

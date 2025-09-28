@@ -57,6 +57,7 @@ Request `newConversation` params (subset):
 - `profile`: optional named profile
 - `cwd`: optional working directory
 - `approvalPolicy`: `untrusted` | `on-request` | `on-failure` | `never`
+- `sensitivePathPrecheckMode`: `ask` | `block` | `off` (defaults to `ask`)
 - `sandbox`: `read-only` | `workspace-write` | `danger-full-access`
 - `config`: map of additional config overrides
 - `baseInstructions`: optional instruction override
@@ -88,6 +89,7 @@ When Codex needs approval to apply changes or run commands, the server issues JS
 
 - `applyPatchApproval { conversationId, callId, fileChanges, reason?, grantRoot? }`
 - `execCommandApproval { conversationId, callId, command, cwd, reason? }`
+  - When the sensitive-path preflight fires in `ask` mode, the `reason` explains which pattern matched so the client can present context to the user.
 
 The client must reply with `{ decision: "allow" | "deny" }` for each request.
 

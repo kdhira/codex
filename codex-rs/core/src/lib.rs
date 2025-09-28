@@ -61,6 +61,7 @@ pub mod project_doc;
 mod rollout;
 pub(crate) mod safety;
 pub mod seatbelt;
+pub mod sensitive_paths;
 pub mod shell;
 pub mod spawn;
 pub mod terminal;

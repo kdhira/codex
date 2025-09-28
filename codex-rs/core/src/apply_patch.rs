@@ -44,6 +44,7 @@ pub(crate) async fn apply_patch(
         turn_context.approval_policy,
         &turn_context.sandbox_policy,
         &turn_context.cwd,
+        &turn_context.sensitive_path_config,
     ) {
         SafetyCheck::AutoApprove {
             user_explicitly_approved,
@@ -52,7 +53,7 @@ pub(crate) async fn apply_patch(
             action,
             user_explicitly_approved_this_action: user_explicitly_approved,
         }),
-        SafetyCheck::AskUser => {
+        SafetyCheck::AskUser { reason } => {
             // Compute a readable summary of path changes to include in the
             // approval request so the user can make an informed decision.
             //
@@ -61,7 +62,13 @@ pub(crate) async fn apply_patch(
             // that similar patches can be auto-approved in the future during
             // this session.
             let rx_approve = sess
-                .request_patch_approval(sub_id.to_owned(), call_id.to_owned(), &action, None, None)
+                .request_patch_approval(
+                    sub_id.to_owned(),
+                    call_id.to_owned(),
+                    &action,
+                    reason,
+                    None,
+                )
                 .await;
             match rx_approve.await.unwrap_or_default() {
                 ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
