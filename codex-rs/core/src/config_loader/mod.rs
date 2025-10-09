@@ -147,6 +147,15 @@ pub(crate) fn merge_toml_values(base: &mut TomlValue, overlay: &TomlValue) {
 }
 
 fn managed_config_default_path(codex_home: &Path) -> PathBuf {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if let Some(raw) = std::env::var_os("CODEX_MANAGED_CONFIG_PATH")
+            && !raw.is_empty()
+        {
+            return PathBuf::from(raw);
+        }
+    }
+
     #[cfg(unix)]
     {
         let _ = codex_home;
@@ -176,7 +185,35 @@ fn apply_managed_layers(layers: LoadedConfigLayers) -> TomlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(original) = self.original.take() {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn merges_managed_config_layer_on_top() {
@@ -307,5 +344,17 @@ flag = true
             Some(&TomlValue::String("managed".to_string()))
         );
         assert_eq!(nested.get("flag"), Some(&TomlValue::Boolean(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn managed_config_path_respects_env_override() {
+        let tmp = tempdir().expect("tempdir");
+        let override_path = tmp.path().join("override.toml");
+        std::fs::write(&override_path, "").expect("write override");
+
+        let _guard = EnvVarGuard::set("CODEX_MANAGED_CONFIG_PATH", override_path.as_os_str());
+        let resolved = super::managed_config_default_path(tmp.path());
+        assert_eq!(resolved, override_path);
     }
 }

@@ -2,6 +2,7 @@ use crate::auth::AuthCredentialsStoreMode;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
+use crate::config::types::McpServerTransportConfig;
 use crate::config::types::Notice;
 use crate::config::types::Notifications;
 use crate::config::types::OtelConfig;
@@ -14,7 +15,6 @@ use crate::config::types::ShellEnvironmentPolicyToml;
 use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
 use crate::config_loader::LoadedConfigLayers;
-use crate::config_loader::load_config_as_toml;
 use crate::config_loader::load_config_layers_with_overrides;
 use crate::config_loader::merge_toml_values;
 use crate::features::Feature;
@@ -71,6 +71,193 @@ pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5-codex";
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerProvenance {
+    User,
+    ManagedConfig,
+    ManagedPreferences,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpServerFlags {
+    pub overall_enabled: bool,
+    pub user_enabled: bool,
+}
+
+impl Default for McpServerFlags {
+    fn default() -> Self {
+        Self {
+            overall_enabled: true,
+            user_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerMetadata {
+    pub provenance: McpServerProvenance,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerRejection {
+    pub name: String,
+    pub provenance: McpServerProvenance,
+    pub reason: McpServerRejectionReason,
+}
+
+#[derive(Debug, Clone)]
+pub enum McpServerRejectionReason {
+    UserServersDisabled,
+    AllServersDisabled,
+    PolicyDenied {
+        rule: Option<String>,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for McpServerProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "user"),
+            Self::ManagedConfig => write!(f, "managed"),
+            Self::ManagedPreferences => write!(f, "managed-preferences"),
+        }
+    }
+}
+
+impl std::fmt::Display for McpServerRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserServersDisabled => {
+                write!(f, "user-defined MCP servers are disabled by policy")
+            }
+            Self::AllServersDisabled => {
+                write!(f, "all MCP servers are disabled by policy")
+            }
+            Self::PolicyDenied { rule, message } => {
+                if let Some(rule) = rule {
+                    write!(f, "blocked by policy rule '{rule}': {message}")
+                } else {
+                    write!(f, "blocked by policy: {message}")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerResolution {
+    pub effective: BTreeMap<String, McpServerConfig>,
+    pub metadata: BTreeMap<String, McpServerMetadata>,
+    pub user_entries: BTreeMap<String, McpServerConfig>,
+    pub managed_entries: BTreeMap<String, McpServerConfig>,
+    pub rejections: Vec<McpServerRejection>,
+    pub migrated_user_duplicates: Vec<String>,
+    pub flags: McpServerFlags,
+}
+
+impl McpServerResolution {
+    fn empty() -> Self {
+        Self {
+            effective: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            user_entries: BTreeMap::new(),
+            managed_entries: BTreeMap::new(),
+            rejections: Vec::new(),
+            migrated_user_duplicates: Vec::new(),
+            flags: McpServerFlags::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum McpPolicyAction {
+    #[default]
+    Allow,
+    Deny,
+}
+
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+struct ManagedConfigSectionToml {
+    #[serde(default)]
+    enable_mcp_servers: Option<bool>,
+    #[serde(default)]
+    enable_user_mcp_servers: Option<bool>,
+    #[serde(default)]
+    mcp_policy: Option<ManagedMcpPolicyToml>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+struct ManagedMcpPolicyToml {
+    #[serde(default)]
+    default_action: Option<McpPolicyAction>,
+    #[serde(default)]
+    http: Vec<ManagedMcpHttpPolicyRuleToml>,
+    #[serde(default)]
+    stdio: Vec<ManagedMcpStdioPolicyRuleToml>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ManagedMcpHttpPolicyRuleToml {
+    #[serde(default)]
+    action: Option<McpPolicyAction>,
+    url_prefix: String,
+    #[serde(default)]
+    requires_bearer_token: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ManagedMcpStdioPolicyRuleToml {
+    #[serde(default)]
+    action: Option<McpPolicyAction>,
+    command_prefix: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ManagedMcpPolicy {
+    default_action: McpPolicyAction,
+    http_rules: Vec<McpHttpPolicyRule>,
+    stdio_rules: Vec<McpStdioPolicyRule>,
+}
+
+impl Default for ManagedMcpPolicy {
+    fn default() -> Self {
+        Self {
+            default_action: McpPolicyAction::Allow,
+            http_rules: Vec::new(),
+            stdio_rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct McpHttpPolicyRule {
+    action: McpPolicyAction,
+    url_prefix: String,
+    requires_bearer_token: Option<bool>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct McpStdioPolicyRule {
+    action: McpPolicyAction,
+    command_prefix: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ManagedMcpSettings {
+    flags: McpServerFlags,
+    policy: ManagedMcpPolicy,
+}
 
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
@@ -321,44 +508,440 @@ async fn load_resolved_config(
     overrides: crate::config_loader::LoaderOverrides,
 ) -> std::io::Result<TomlValue> {
     let layers = load_config_layers_with_overrides(codex_home, overrides).await?;
-    Ok(apply_overlays(layers, cli_overrides))
+    let merged = apply_overlays(layers, cli_overrides)?;
+
+    Ok(merged)
 }
 
 fn apply_overlays(
     layers: LoadedConfigLayers,
     cli_overrides: Vec<(String, TomlValue)>,
-) -> TomlValue {
-    let LoadedConfigLayers {
-        mut base,
-        managed_config,
-        managed_preferences,
-    } = layers;
+) -> std::io::Result<TomlValue> {
+    let (merged, _) = resolve_mcp_servers_for_layers(
+        layers.base,
+        cli_overrides,
+        layers.managed_config,
+        layers.managed_preferences,
+        true,
+    )?;
 
+    Ok(merged)
+}
+
+fn resolve_mcp_servers_for_layers(
+    mut base: TomlValue,
+    cli_overrides: Vec<(String, TomlValue)>,
+    mut managed_config: Option<TomlValue>,
+    mut managed_preferences: Option<TomlValue>,
+    log_duplicates: bool,
+) -> std::io::Result<(TomlValue, McpServerResolution)> {
     for (path, value) in cli_overrides.into_iter() {
         apply_toml_override(&mut base, &path, value);
     }
+
+    let user_mcp_table = take_mcp_servers_table(&mut base);
+    let managed_config_mcp = managed_config.as_mut().and_then(take_mcp_servers_table);
+    let managed_preferences_mcp = managed_preferences
+        .as_mut()
+        .and_then(take_mcp_servers_table);
 
     for overlay in [managed_config, managed_preferences].into_iter().flatten() {
         merge_toml_values(&mut base, &overlay);
     }
 
-    base
+    let settings = ManagedMcpSettings::from_root(&base)?;
+
+    let user_entries = parse_mcp_server_table(user_mcp_table)?;
+    let managed_config_entries = parse_mcp_server_table(managed_config_mcp)?;
+    let managed_preferences_entries = parse_mcp_server_table(managed_preferences_mcp)?;
+
+    let resolution = resolve_mcp_servers_internal(
+        user_entries,
+        managed_config_entries,
+        managed_preferences_entries,
+        settings,
+    )?;
+
+    insert_effective_mcp_servers(&mut base, &resolution.effective)?;
+
+    if log_duplicates && !resolution.migrated_user_duplicates.is_empty() {
+        tracing::info!(
+            entries = %resolution.migrated_user_duplicates.join(", "),
+            "Removed managed MCP servers duplicated in user config"
+        );
+    }
+
+    Ok((base, resolution))
+}
+
+fn take_mcp_servers_table(value: &mut TomlValue) -> Option<TomlValue> {
+    value
+        .as_table_mut()
+        .and_then(|table| table.remove("mcp_servers"))
+}
+
+fn parse_mcp_server_table(
+    value: Option<TomlValue>,
+) -> std::io::Result<BTreeMap<String, McpServerConfig>> {
+    let Some(raw) = value else {
+        return Ok(BTreeMap::new());
+    };
+
+    ensure_no_inline_bearer_tokens(&raw)?;
+
+    raw.try_into()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn insert_effective_mcp_servers(
+    root: &mut TomlValue,
+    effective: &BTreeMap<String, McpServerConfig>,
+) -> std::io::Result<()> {
+    let table = root.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "config root must be a table")
+    })?;
+
+    if effective.is_empty() {
+        table.remove("mcp_servers");
+        return Ok(());
+    }
+
+    let mut rendered = toml::map::Map::new();
+    for (name, cfg) in effective.iter() {
+        let value = TomlValue::try_from(cfg.clone())
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        rendered.insert(name.clone(), value);
+    }
+
+    table.insert("mcp_servers".to_string(), TomlValue::Table(rendered));
+    Ok(())
+}
+
+impl ManagedMcpSettings {
+    fn from_root(root: &TomlValue) -> std::io::Result<Self> {
+        let mut settings = Self {
+            flags: McpServerFlags::default(),
+            policy: ManagedMcpPolicy::default(),
+        };
+
+        let Some(root_table) = root.as_table() else {
+            return Ok(settings);
+        };
+
+        let Some(managed_value) = root_table.get("managed") else {
+            return Ok(settings);
+        };
+
+        let section: ManagedConfigSectionToml = managed_value
+            .clone()
+            .try_into()
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+
+        if let Some(enabled) = section.enable_mcp_servers {
+            settings.flags.overall_enabled = enabled;
+            if !enabled {
+                settings.flags.user_enabled = false;
+            }
+        }
+        if let Some(enabled) = section.enable_user_mcp_servers {
+            settings.flags.user_enabled = enabled;
+        }
+        if !settings.flags.overall_enabled {
+            settings.flags.user_enabled = false;
+        }
+        if let Some(policy) = section.mcp_policy {
+            settings.policy = policy.into();
+        }
+
+        Ok(settings)
+    }
+}
+
+impl From<ManagedMcpPolicyToml> for ManagedMcpPolicy {
+    fn from(value: ManagedMcpPolicyToml) -> Self {
+        let default_action = value.default_action.unwrap_or_default();
+        let http_rules = value
+            .http
+            .into_iter()
+            .map(|rule| McpHttpPolicyRule {
+                action: rule.action.unwrap_or_default(),
+                url_prefix: rule.url_prefix,
+                requires_bearer_token: rule.requires_bearer_token,
+                name: rule.name,
+            })
+            .collect();
+        let stdio_rules = value
+            .stdio
+            .into_iter()
+            .map(|rule| McpStdioPolicyRule {
+                action: rule.action.unwrap_or_default(),
+                command_prefix: rule.command_prefix,
+                name: rule.name,
+            })
+            .collect();
+
+        Self {
+            default_action,
+            http_rules,
+            stdio_rules,
+        }
+    }
+}
+
+fn resolve_mcp_servers_internal(
+    mut user_entries: BTreeMap<String, McpServerConfig>,
+    managed_config_entries: BTreeMap<String, McpServerConfig>,
+    managed_preferences_entries: BTreeMap<String, McpServerConfig>,
+    settings: ManagedMcpSettings,
+) -> std::io::Result<McpServerResolution> {
+    let mut resolution = McpServerResolution::empty();
+    resolution.flags = settings.flags;
+
+    let mut duplicates: Vec<String> = user_entries
+        .iter()
+        .filter_map(|(name, cfg)| {
+            managed_preferences_entries
+                .get(name)
+                .or_else(|| managed_config_entries.get(name))
+                .filter(|managed| *managed == cfg)
+                .map(|_| name.clone())
+        })
+        .collect();
+    duplicates.sort();
+    duplicates.dedup();
+    for name in duplicates {
+        if user_entries.remove(&name).is_some() {
+            resolution.migrated_user_duplicates.push(name);
+        }
+    }
+
+    resolution.user_entries = user_entries.clone();
+
+    let mut managed_entries = managed_config_entries.clone();
+    for (name, cfg) in managed_preferences_entries.iter() {
+        managed_entries.insert(name.clone(), cfg.clone());
+    }
+    resolution.managed_entries = managed_entries;
+
+    if !resolution.flags.overall_enabled {
+        for name in resolution.user_entries.keys() {
+            resolution.rejections.push(McpServerRejection {
+                name: name.clone(),
+                provenance: McpServerProvenance::User,
+                reason: McpServerRejectionReason::AllServersDisabled,
+            });
+        }
+
+        for name in managed_config_entries.keys() {
+            resolution.rejections.push(McpServerRejection {
+                name: name.clone(),
+                provenance: McpServerProvenance::ManagedConfig,
+                reason: McpServerRejectionReason::AllServersDisabled,
+            });
+        }
+
+        for name in managed_preferences_entries.keys() {
+            resolution.rejections.push(McpServerRejection {
+                name: name.clone(),
+                provenance: McpServerProvenance::ManagedPreferences,
+                reason: McpServerRejectionReason::AllServersDisabled,
+            });
+        }
+
+        return Ok(resolution);
+    }
+
+    for (name, cfg) in resolution.user_entries.iter() {
+        if !resolution.flags.user_enabled {
+            resolution.rejections.push(McpServerRejection {
+                name: name.clone(),
+                provenance: McpServerProvenance::User,
+                reason: McpServerRejectionReason::UserServersDisabled,
+            });
+            continue;
+        }
+
+        match evaluate_policy(cfg, &settings.policy) {
+            PolicyDecision::Allow => {
+                resolution.effective.insert(name.clone(), cfg.clone());
+                resolution.metadata.insert(
+                    name.clone(),
+                    McpServerMetadata {
+                        provenance: McpServerProvenance::User,
+                    },
+                );
+            }
+            PolicyDecision::Deny { rule_name, message } => {
+                resolution.rejections.push(McpServerRejection {
+                    name: name.clone(),
+                    provenance: McpServerProvenance::User,
+                    reason: McpServerRejectionReason::PolicyDenied {
+                        rule: rule_name,
+                        message,
+                    },
+                });
+            }
+        }
+    }
+
+    if resolution.flags.overall_enabled {
+        for (name, cfg) in managed_config_entries.iter() {
+            match evaluate_policy(cfg, &settings.policy) {
+                PolicyDecision::Allow => {
+                    resolution.effective.insert(name.clone(), cfg.clone());
+                    resolution.metadata.insert(
+                        name.clone(),
+                        McpServerMetadata {
+                            provenance: McpServerProvenance::ManagedConfig,
+                        },
+                    );
+                }
+                PolicyDecision::Deny { rule_name, message } => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "managed MCP server '{name}' denied by policy{}: {message}",
+                            rule_name
+                                .as_ref()
+                                .map(|r| format!(" (rule '{r}')"))
+                                .unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        for (name, cfg) in managed_preferences_entries.iter() {
+            match evaluate_policy(cfg, &settings.policy) {
+                PolicyDecision::Allow => {
+                    resolution.effective.insert(name.clone(), cfg.clone());
+                    resolution.metadata.insert(
+                        name.clone(),
+                        McpServerMetadata {
+                            provenance: McpServerProvenance::ManagedPreferences,
+                        },
+                    );
+                }
+                PolicyDecision::Deny { rule_name, message } => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "managed preferences MCP server '{name}' denied by policy{}: {message}",
+                            rule_name
+                                .as_ref()
+                                .map(|r| format!(" (rule '{r}')"))
+                                .unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(resolution)
+}
+
+enum PolicyDecision {
+    Allow,
+    Deny {
+        rule_name: Option<String>,
+        message: String,
+    },
+}
+
+fn evaluate_policy(config: &McpServerConfig, policy: &ManagedMcpPolicy) -> PolicyDecision {
+    match &config.transport {
+        McpServerTransportConfig::StreamableHttp {
+            url,
+            bearer_token_env_var,
+            ..
+        } => {
+            for rule in &policy.http_rules {
+                if url.starts_with(&rule.url_prefix) {
+                    if rule.requires_bearer_token == Some(true) && bearer_token_env_var.is_none() {
+                        return PolicyDecision::Deny {
+                            rule_name: rule.name.clone(),
+                            message: format!(
+                                "requires bearer_token_env_var because of allow rule matching prefix {}",
+                                rule.url_prefix
+                            ),
+                        };
+                    }
+
+                    return match rule.action {
+                        McpPolicyAction::Allow => PolicyDecision::Allow,
+                        McpPolicyAction::Deny => PolicyDecision::Deny {
+                            rule_name: rule.name.clone(),
+                            message: format!(
+                                "blocked by deny rule matching prefix {}",
+                                rule.url_prefix
+                            ),
+                        },
+                    };
+                }
+            }
+
+            match policy.default_action {
+                McpPolicyAction::Allow => PolicyDecision::Allow,
+                McpPolicyAction::Deny => PolicyDecision::Deny {
+                    rule_name: None,
+                    message: "no policy rule matched and default action is deny".to_string(),
+                },
+            }
+        }
+        McpServerTransportConfig::Stdio { command, .. } => {
+            for rule in &policy.stdio_rules {
+                if command.starts_with(&rule.command_prefix) {
+                    return match rule.action {
+                        McpPolicyAction::Allow => PolicyDecision::Allow,
+                        McpPolicyAction::Deny => PolicyDecision::Deny {
+                            rule_name: rule.name.clone(),
+                            message: format!(
+                                "blocked by deny rule matching command prefix {}",
+                                rule.command_prefix
+                            ),
+                        },
+                    };
+                }
+            }
+
+            match policy.default_action {
+                McpPolicyAction::Allow => PolicyDecision::Allow,
+                McpPolicyAction::Deny => PolicyDecision::Deny {
+                    rule_name: None,
+                    message: "no policy rule matched and default action is deny".to_string(),
+                },
+            }
+        }
+    }
+}
+
+pub async fn load_mcp_server_resolution(
+    codex_home: &Path,
+    cli_overrides: Vec<(String, TomlValue)>,
+) -> std::io::Result<McpServerResolution> {
+    let layers = load_config_layers_with_overrides(
+        codex_home,
+        crate::config_loader::LoaderOverrides::default(),
+    )
+    .await?;
+
+    let (_, resolution) = resolve_mcp_servers_for_layers(
+        layers.base,
+        cli_overrides,
+        layers.managed_config,
+        layers.managed_preferences,
+        false,
+    )?;
+
+    Ok(resolution)
 }
 
 pub async fn load_global_mcp_servers(
     codex_home: &Path,
 ) -> std::io::Result<BTreeMap<String, McpServerConfig>> {
-    let root_value = load_config_as_toml(codex_home).await?;
-    let Some(servers_value) = root_value.get("mcp_servers") else {
-        return Ok(BTreeMap::new());
-    };
-
-    ensure_no_inline_bearer_tokens(servers_value)?;
-
-    servers_value
-        .clone()
-        .try_into()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let resolution = load_mcp_server_resolution(codex_home, Vec::new()).await?;
+    Ok(resolution.effective)
 }
 
 /// We briefly allowed plain text bearer_token fields in MCP server configs.
@@ -1286,9 +1869,61 @@ mod tests {
 
     use super::*;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(original) = self.original.take() {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn enable_user_mcp_servers_for_test(codex_home: &Path) -> anyhow::Result<EnvVarGuard> {
+        let managed_path = codex_home.join("managed_config.toml");
+        std::fs::write(
+            &managed_path,
+            "[managed]\n\
+enable_mcp_servers = true\n\
+enable_user_mcp_servers = true\n",
+        )?;
+
+        Ok(EnvVarGuard::set(
+            "CODEX_MANAGED_CONFIG_PATH",
+            managed_path.as_os_str(),
+        ))
+    }
+
+    fn write_global_mcp_servers(
+        codex_home: &Path,
+        servers: &BTreeMap<String, McpServerConfig>,
+    ) -> anyhow::Result<()> {
+        ConfigEditsBuilder::new(codex_home)
+            .replace_mcp_servers(servers)
+            .apply_blocking()
+    }
 
     #[test]
     fn test_toml_parsing() {
@@ -1805,8 +2440,10 @@ trust_level = "trusted"
     }
 
     #[tokio::test]
-    async fn replace_mcp_servers_round_trips_entries() -> anyhow::Result<()> {
+    #[serial]
+    async fn replace_global_mcp_servers_round_trips_entries() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let mut servers = BTreeMap::new();
         servers.insert(
@@ -1869,6 +2506,398 @@ trust_level = "trusted"
     }
 
     #[tokio::test]
+    async fn managed_entries_not_serialized_to_user_config() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+
+        std::fs::write(
+            &managed_path,
+            r#"[mcp_servers.docs]
+command = "echo"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(resolution.user_entries.is_empty());
+        assert!(resolution.effective.contains_key("docs"));
+
+        write_global_mcp_servers(codex_home.path(), &resolution.user_entries)?;
+
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        if config_path.exists() {
+            let contents = std::fs::read_to_string(config_path)?;
+            assert!(!contents.contains("mcp_servers"));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_add_preserves_managed_entries() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[mcp_servers.docs]
+command = "echo"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.notes]
+command = "cat"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        let mut user_entries = resolution.user_entries.clone();
+        user_entries.insert(
+            "writer".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "write".to_string(),
+                    args: vec!["--append".to_string()],
+                    env: None,
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                enabled: true,
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        );
+
+        write_global_mcp_servers(codex_home.path(), &user_entries)?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, final_resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+        assert!(final_resolution.effective.contains_key("docs"));
+        assert!(final_resolution.effective.contains_key("notes"));
+        assert!(final_resolution.effective.contains_key("writer"));
+
+        let user_config = std::fs::read_to_string(config_path)?;
+        assert!(user_config.contains("mcp_servers.notes"));
+        assert!(user_config.contains("mcp_servers.writer"));
+        assert!(!user_config.contains("mcp_servers.docs"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_mcp_servers_disabled_strips_user_entries() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[managed]
+enable_user_mcp_servers = false
+
+[mcp_servers.docs]
+command = "echo"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.notes]
+command = "cat"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(resolution.effective.contains_key("docs"));
+        assert!(!resolution.effective.contains_key("notes"));
+
+        let rejection = resolution
+            .rejections
+            .iter()
+            .find(|r| r.name == "notes")
+            .expect("user entry should be rejected");
+        assert!(matches!(
+            rejection.reason,
+            McpServerRejectionReason::UserServersDisabled
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_mcp_servers_disabled_filters_all_entries() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[managed]
+enable_mcp_servers = false
+
+[mcp_servers.docs]
+command = "echo"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.notes]
+command = "cat"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(resolution.effective.is_empty());
+
+        let docs_rejection = resolution
+            .rejections
+            .iter()
+            .find(|r| r.name == "docs")
+            .expect("managed entry should be rejected");
+        assert!(matches!(
+            docs_rejection.reason,
+            McpServerRejectionReason::AllServersDisabled
+        ));
+
+        let notes_rejection = resolution
+            .rejections
+            .iter()
+            .find(|r| r.name == "notes")
+            .expect("user entry should be rejected");
+        assert!(matches!(
+            notes_rejection.reason,
+            McpServerRejectionReason::AllServersDisabled
+        ));
+
+        assert!(!resolution.flags.overall_enabled);
+        assert!(!resolution.flags.user_enabled);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_allows_matching_http_server() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[managed.mcp_policy]
+default_action = "deny"
+
+[[managed.mcp_policy.http]]
+action = "allow"
+url_prefix = "https://allowed.example.com/"
+name = "allow-allowed"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.web]
+url = "https://allowed.example.com/service"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(resolution.rejections.is_empty());
+        assert!(resolution.effective.contains_key("web"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_denies_unapproved_http_server() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[managed.mcp_policy]
+default_action = "deny"
+
+[[managed.mcp_policy.http]]
+action = "allow"
+url_prefix = "https://allowed.example.com/"
+name = "allow-allowed"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.web]
+url = "https://blocked.example.com/service"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(!resolution.effective.contains_key("web"));
+        let rejection = resolution
+            .rejections
+            .iter()
+            .find(|r| r.name == "web")
+            .expect("entry should be rejected");
+        assert!(matches!(
+            rejection.reason,
+            McpServerRejectionReason::PolicyDenied { .. }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_default_deny_blocks_missing_rule() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &managed_path,
+            r#"[managed.mcp_policy]
+default_action = "deny"
+"#,
+        )?;
+
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.web]
+url = "https://unknown.example.com/service"
+"#,
+        )?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let layers = load_config_layers_with_overrides(codex_home.path(), overrides).await?;
+        let (_, resolution) = resolve_mcp_servers_for_layers(
+            layers.base,
+            Vec::new(),
+            layers.managed_config,
+            layers.managed_preferences,
+            false,
+        )?;
+
+        assert!(!resolution.effective.contains_key("web"));
+        let rejection = resolution
+            .rejections
+            .iter()
+            .find(|r| r.name == "web")
+            .expect("entry should be rejected");
+        assert!(matches!(
+            rejection.reason,
+            McpServerRejectionReason::PolicyDenied { .. }
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn managed_config_wins_over_cli_overrides() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
         let managed_path = codex_home.path().join("managed_config.toml");
@@ -1902,8 +2931,10 @@ trust_level = "trusted"
     }
 
     #[tokio::test]
+    #[serial]
     async fn load_global_mcp_servers_accepts_legacy_ms_field() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
         let config_path = codex_home.path().join(CONFIG_TOML_FILE);
 
         std::fs::write(
@@ -1924,8 +2955,10 @@ startup_timeout_ms = 2500
     }
 
     #[tokio::test]
+    #[serial]
     async fn load_global_mcp_servers_rejects_inline_bearer_token() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
         let config_path = codex_home.path().join(CONFIG_TOML_FILE);
 
         std::fs::write(
@@ -1949,8 +2982,10 @@ bearer_token = "secret"
     }
 
     #[tokio::test]
-    async fn replace_mcp_servers_serializes_env_sorted() -> anyhow::Result<()> {
+    #[serial]
+    async fn replace_global_mcp_servers_serializes_env_sorted() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2022,6 +3057,7 @@ ZIG_VAR = "3"
     #[tokio::test]
     async fn replace_mcp_servers_serializes_env_vars() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2069,6 +3105,7 @@ ZIG_VAR = "3"
     #[tokio::test]
     async fn replace_mcp_servers_serializes_cwd() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let cwd_path = PathBuf::from("/tmp/codex-mcp");
         let servers = BTreeMap::from([(
@@ -2117,6 +3154,7 @@ ZIG_VAR = "3"
     #[tokio::test]
     async fn replace_mcp_servers_streamable_http_serializes_bearer_token() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2176,6 +3214,7 @@ startup_timeout_sec = 2.0
     #[tokio::test]
     async fn replace_mcp_servers_streamable_http_serializes_custom_headers() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2248,6 +3287,7 @@ X-Auth = "DOCS_AUTH"
     #[tokio::test]
     async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let config_path = codex_home.path().join(CONFIG_TOML_FILE);
 
@@ -2337,6 +3377,7 @@ url = "https://example.com/mcp"
     async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers()
     -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
         let config_path = codex_home.path().join(CONFIG_TOML_FILE);
 
         let servers = BTreeMap::from([
@@ -2439,8 +3480,10 @@ url = "https://example.com/mcp"
     }
 
     #[tokio::test]
-    async fn replace_mcp_servers_serializes_disabled_flag() -> anyhow::Result<()> {
+    #[serial]
+    async fn replace_global_mcp_servers_serializes_disabled_flag() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2483,6 +3526,7 @@ url = "https://example.com/mcp"
     #[tokio::test]
     async fn replace_mcp_servers_serializes_tool_filters() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
+        let _guard = enable_user_mcp_servers_for_test(codex_home.path())?;
 
         let servers = BTreeMap::from([(
             "docs".to_string(),

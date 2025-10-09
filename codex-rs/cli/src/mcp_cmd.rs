@@ -11,7 +11,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
-use codex_core::config::load_global_mcp_servers;
+use codex_core::config::load_mcp_server_resolution;
 use codex_core::config::types::McpServerConfig;
 use codex_core::config::types::McpServerTransportConfig;
 use codex_core::features::Feature;
@@ -211,9 +211,17 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
     validate_server_name(&name)?;
 
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let mut servers = load_global_mcp_servers(&codex_home)
+    let resolution = load_mcp_server_resolution(&codex_home, Vec::new())
         .await
         .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
+
+    if !resolution.flags.user_enabled {
+        bail!(
+            "User-defined MCP servers are disabled by managed policy; contact your administrator."
+        );
+    }
+
+    let mut servers = resolution.user_entries;
 
     let transport = match transport_args {
         AddMcpTransportArgs {
@@ -321,9 +329,17 @@ async fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveAr
     validate_server_name(&name)?;
 
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let mut servers = load_global_mcp_servers(&codex_home)
+    let resolution = load_mcp_server_resolution(&codex_home, Vec::new())
         .await
         .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
+
+    if !resolution.flags.user_enabled {
+        bail!(
+            "User-defined MCP servers are disabled by managed policy; contact your administrator."
+        );
+    }
+
+    let mut servers = resolution.user_entries;
 
     let removed = servers.remove(&name).is_some();
 
@@ -337,6 +353,10 @@ async fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveAr
 
     if removed {
         println!("Removed global MCP server '{name}'.");
+    } else if resolution.managed_entries.contains_key(&name) {
+        println!(
+            "MCP server '{name}' is centrally managed and cannot be removed from user config."
+        );
     } else {
         println!("No MCP server named '{name}' found.");
     }
@@ -420,9 +440,14 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     let overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
-    let config = Config::load_with_cli_overrides(overrides, ConfigOverrides::default())
+    let config = Config::load_with_cli_overrides(overrides.clone(), ConfigOverrides::default())
         .await
         .context("failed to load configuration")?;
+
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let resolution = load_mcp_server_resolution(&codex_home, overrides.clone())
+        .await
+        .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
 
     let mut entries: Vec<_> = config.mcp_servers.iter().collect();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -434,12 +459,17 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
 
     if list_args.json {
         let json_entries: Vec<_> = entries
-            .into_iter()
+            .iter()
             .map(|(name, cfg)| {
                 let auth_status = auth_statuses
                     .get(name.as_str())
                     .map(|entry| entry.auth_status)
                     .unwrap_or(McpAuthStatus::Unsupported);
+                let source = resolution
+                    .metadata
+                    .get(name.as_str())
+                    .map(|meta| meta.provenance.to_string())
+                    .unwrap_or_else(|| "user".to_string());
                 let transport = match &cfg.transport {
                     McpServerTransportConfig::Stdio {
                         command,
@@ -482,21 +512,68 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                         .tool_timeout_sec
                         .map(|timeout| timeout.as_secs_f64()),
                     "auth_status": auth_status,
+                    "source": source,
                 })
             })
             .collect();
         let output = serde_json::to_string_pretty(&json_entries)?;
         println!("{output}");
+        if !resolution.rejections.is_empty() {
+            for rejection in &resolution.rejections {
+                eprintln!(
+                    "Filtered {name} ({provenance}): {reason}",
+                    name = rejection.name,
+                    provenance = rejection.provenance,
+                    reason = rejection.reason,
+                );
+            }
+        }
+        if !resolution.migrated_user_duplicates.is_empty() {
+            eprintln!(
+                "Removed duplicated managed MCP entries from user config: {}",
+                resolution.migrated_user_duplicates.join(", ")
+            );
+        }
         return Ok(());
     }
 
     if entries.is_empty() {
-        println!("No MCP servers configured yet. Try `codex mcp add my-tool -- my-command`.");
+        println!("No MCP servers currently active.");
+        if resolution.rejections.is_empty() {
+            println!("Try `codex mcp add my-tool -- my-command` to add one.");
+        }
+        if !resolution.rejections.is_empty() {
+            println!();
+            println!("Filtered MCP servers:");
+            for rejection in &resolution.rejections {
+                println!(
+                    "  - {name} ({provenance}) {reason}",
+                    name = rejection.name,
+                    provenance = rejection.provenance,
+                    reason = rejection.reason,
+                );
+            }
+        }
+        if !resolution.migrated_user_duplicates.is_empty() {
+            println!();
+            println!(
+                "Removed duplicated managed MCP entries from user config: {}",
+                resolution.migrated_user_duplicates.join(", ")
+            );
+        }
         return Ok(());
     }
 
-    let mut stdio_rows: Vec<[String; 7]> = Vec::new();
-    let mut http_rows: Vec<[String; 5]> = Vec::new();
+    let mut stdio_rows: Vec<[String; 8]> = Vec::new();
+    let mut http_rows: Vec<[String; 6]> = Vec::new();
+
+    let source_label = |name: &str| -> String {
+        resolution
+            .metadata
+            .get(name)
+            .map(|meta| meta.provenance.to_string())
+            .unwrap_or_else(|| "user".to_string())
+    };
 
     for (name, cfg) in entries {
         match &cfg.transport {
@@ -528,6 +605,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                     .map(|entry| entry.auth_status)
                     .unwrap_or(McpAuthStatus::Unsupported)
                     .to_string();
+                let source = source_label(name.as_str());
                 stdio_rows.push([
                     name.clone(),
                     command.clone(),
@@ -536,6 +614,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                     cwd_display,
                     status,
                     auth_status,
+                    source,
                 ]);
             }
             McpServerTransportConfig::StreamableHttp {
@@ -555,12 +634,14 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                     .to_string();
                 let bearer_token_display =
                     bearer_token_env_var.as_deref().unwrap_or("-").to_string();
+                let source = source_label(name.as_str());
                 http_rows.push([
                     name.clone(),
                     url.clone(),
                     bearer_token_display,
                     status,
                     auth_status,
+                    source,
                 ]);
             }
         }
@@ -575,6 +656,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
             "Cwd".len(),
             "Status".len(),
             "Auth".len(),
+            "Source".len(),
         ];
         for row in &stdio_rows {
             for (i, cell) in row.iter().enumerate() {
@@ -583,7 +665,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
         }
 
         println!(
-            "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}",
+            "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}  {source:<source_w$}",
             name = "Name",
             command = "Command",
             args = "Args",
@@ -591,6 +673,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
             cwd = "Cwd",
             status = "Status",
             auth = "Auth",
+            source = "Source",
             name_w = widths[0],
             cmd_w = widths[1],
             args_w = widths[2],
@@ -598,11 +681,12 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
             cwd_w = widths[4],
             status_w = widths[5],
             auth_w = widths[6],
+            source_w = widths[7],
         );
 
         for row in &stdio_rows {
             println!(
-                "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}",
+                "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}  {source:<source_w$}",
                 name = row[0].as_str(),
                 command = row[1].as_str(),
                 args = row[2].as_str(),
@@ -610,6 +694,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                 cwd = row[4].as_str(),
                 status = row[5].as_str(),
                 auth = row[6].as_str(),
+                source = row[7].as_str(),
                 name_w = widths[0],
                 cmd_w = widths[1],
                 args_w = widths[2],
@@ -617,6 +702,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
                 cwd_w = widths[4],
                 status_w = widths[5],
                 auth_w = widths[6],
+                source_w = widths[7],
             );
         }
     }
@@ -628,10 +714,11 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     if !http_rows.is_empty() {
         let mut widths = [
             "Name".len(),
-            "Url".len(),
-            "Bearer Token Env Var".len(),
+            "URL".len(),
+            "Bearer Token Env".len(),
             "Status".len(),
             "Auth".len(),
+            "Source".len(),
         ];
         for row in &http_rows {
             for (i, cell) in row.iter().enumerate() {
@@ -640,34 +727,59 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
         }
 
         println!(
-            "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}",
+            "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}  {source:<source_w$}",
             name = "Name",
-            url = "Url",
-            token = "Bearer Token Env Var",
+            url = "URL",
+            token = "Bearer Token Env",
             status = "Status",
             auth = "Auth",
+            source = "Source",
             name_w = widths[0],
             url_w = widths[1],
             token_w = widths[2],
             status_w = widths[3],
             auth_w = widths[4],
+            source_w = widths[5],
         );
 
         for row in &http_rows {
             println!(
-                "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}",
+                "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}  {source:<source_w$}",
                 name = row[0].as_str(),
                 url = row[1].as_str(),
                 token = row[2].as_str(),
                 status = row[3].as_str(),
                 auth = row[4].as_str(),
+                source = row[5].as_str(),
                 name_w = widths[0],
                 url_w = widths[1],
                 token_w = widths[2],
                 status_w = widths[3],
                 auth_w = widths[4],
+                source_w = widths[5],
             );
         }
+    }
+
+    if !resolution.rejections.is_empty() {
+        println!();
+        println!("Filtered MCP servers:");
+        for rejection in &resolution.rejections {
+            println!(
+                "  - {name} ({provenance}) {reason}",
+                name = rejection.name,
+                provenance = rejection.provenance,
+                reason = rejection.reason,
+            );
+        }
+    }
+
+    if !resolution.migrated_user_duplicates.is_empty() {
+        println!();
+        println!(
+            "Removed duplicated managed MCP entries from user config: {}",
+            resolution.migrated_user_duplicates.join(", ")
+        );
     }
 
     Ok(())
@@ -677,13 +789,39 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
     let overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
-    let config = Config::load_with_cli_overrides(overrides, ConfigOverrides::default())
+    let config = Config::load_with_cli_overrides(overrides.clone(), ConfigOverrides::default())
         .await
         .context("failed to load configuration")?;
 
-    let Some(server) = config.mcp_servers.get(&get_args.name) else {
-        bail!("No MCP server named '{name}' found.", name = get_args.name);
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let resolution = load_mcp_server_resolution(&codex_home, overrides.clone())
+        .await
+        .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
+
+    let server = match config.mcp_servers.get(&get_args.name) {
+        Some(server) => server,
+        None => {
+            if let Some(rejection) = resolution
+                .rejections
+                .iter()
+                .find(|r| r.name == get_args.name)
+            {
+                bail!(
+                    "MCP server '{name}' is unavailable: {reason}",
+                    name = get_args.name,
+                    reason = rejection.reason,
+                );
+            }
+
+            bail!("No MCP server named '{name}' found.", name = get_args.name);
+        }
     };
+
+    let source = resolution
+        .metadata
+        .get(get_args.name.as_str())
+        .map(|meta| meta.provenance.to_string())
+        .unwrap_or_else(|| "user".to_string());
 
     if get_args.json {
         let transport = match &server.transport {
@@ -726,6 +864,7 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
             "tool_timeout_sec": server
                 .tool_timeout_sec
                 .map(|timeout| timeout.as_secs_f64()),
+            "source": source,
         }))?;
         println!("{output}");
         return Ok(());
@@ -753,6 +892,9 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
         let disabled_tools_display = format_tool_list(&server.disabled_tools);
         println!("  disabled_tools: {disabled_tools_display}");
     }
+
+    println!("  source: {source}");
+
     match &server.transport {
         McpServerTransportConfig::Stdio {
             command,

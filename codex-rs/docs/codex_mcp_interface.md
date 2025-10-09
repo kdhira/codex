@@ -47,7 +47,11 @@ For a simple inspection UI, you can also try:
 npx @modelcontextprotocol/inspector codex mcp-server
 ```
 
-Use the separate `codex mcp` subcommand to manage configured MCP server launchers in `config.toml`.
+Use the separate `codex mcp` subcommand to manage configured MCP server
+launchers in `config.toml`. The CLI now reports whether a server was defined by
+the user, a managed overlay, or a managed preferences payload; centrally
+managed entries stay read-only. See `docs/config.md` for the new feature flags
+and transport policy controls that administrators can apply.
 
 ## Conversations
 

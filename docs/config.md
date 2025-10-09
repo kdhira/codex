@@ -411,6 +411,10 @@ Currently, `CODEX_SANDBOX_NETWORK_DISABLED=1` is also added to the environment, 
 
 ## MCP integration
 
+Centrally managed deployments can ship read-only overlays that enforce policy
+and bundled MCP definitions. See [Managed configuration](./managed-configuration.md)
+for overlay-specific workflows and CLI behaviour.
+
 ### mcp_servers
 
 You can configure Codex to use [MCP servers](https://modelcontextprotocol.io/about) to give Codex access to external applications, resources, or services.

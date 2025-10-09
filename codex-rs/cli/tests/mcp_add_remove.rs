@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use codex_core::config::load_global_mcp_servers;
@@ -7,17 +8,70 @@ use predicates::str::contains;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
-fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
+const MANAGED_CONFIG_ENV: &str = "CODEX_MANAGED_CONFIG_PATH";
+
+struct EnvVarGuard {
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(value: &std::ffi::OsStr) -> Self {
+        let original = std::env::var_os(MANAGED_CONFIG_ENV);
+        unsafe {
+            std::env::set_var(MANAGED_CONFIG_ENV, value);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(original) = self.original.take() {
+                std::env::set_var(MANAGED_CONFIG_ENV, original);
+            } else {
+                std::env::remove_var(MANAGED_CONFIG_ENV);
+            }
+        }
+    }
+}
+
+struct ManagedConfigGuard {
+    path: PathBuf,
+    _env_guard: EnvVarGuard,
+}
+
+impl ManagedConfigGuard {
+    fn new(codex_home: &Path) -> Result<Self> {
+        let path = codex_home.join("managed_config.toml");
+        std::fs::write(
+            &path,
+            "[managed]\n\
+enable_mcp_servers = true\n\
+enable_user_mcp_servers = true\n",
+        )?;
+        let _env_guard = EnvVarGuard::set(path.as_os_str());
+        Ok(Self { path, _env_guard })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn codex_command(codex_home: &Path, managed_config_path: &Path) -> Result<assert_cmd::Command> {
     let mut cmd = assert_cmd::Command::cargo_bin("codex")?;
     cmd.env("CODEX_HOME", codex_home);
+    cmd.env(MANAGED_CONFIG_ENV, managed_config_path);
     Ok(cmd)
 }
 
 #[tokio::test]
 async fn add_and_remove_server_updates_global_config() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args(["mcp", "add", "docs", "--", "echo", "hello"])
         .assert()
@@ -45,7 +99,7 @@ async fn add_and_remove_server_updates_global_config() -> Result<()> {
     }
     assert!(docs.enabled);
 
-    let mut remove_cmd = codex_command(codex_home.path())?;
+    let mut remove_cmd = codex_command(codex_home.path(), managed_config.path())?;
     remove_cmd
         .args(["mcp", "remove", "docs"])
         .assert()
@@ -55,7 +109,7 @@ async fn add_and_remove_server_updates_global_config() -> Result<()> {
     let servers = load_global_mcp_servers(codex_home.path()).await?;
     assert!(servers.is_empty());
 
-    let mut remove_again_cmd = codex_command(codex_home.path())?;
+    let mut remove_again_cmd = codex_command(codex_home.path(), managed_config.path())?;
     remove_again_cmd
         .args(["mcp", "remove", "docs"])
         .assert()
@@ -71,8 +125,9 @@ async fn add_and_remove_server_updates_global_config() -> Result<()> {
 #[tokio::test]
 async fn add_with_env_preserves_key_order_and_values() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args([
             "mcp",
@@ -107,8 +162,9 @@ async fn add_with_env_preserves_key_order_and_values() -> Result<()> {
 #[tokio::test]
 async fn add_streamable_http_without_manual_token() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args(["mcp", "add", "github", "--url", "https://example.com/mcp"])
         .assert()
@@ -141,8 +197,9 @@ async fn add_streamable_http_without_manual_token() -> Result<()> {
 #[tokio::test]
 async fn add_streamable_http_with_custom_env_var() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args([
             "mcp",
@@ -179,8 +236,9 @@ async fn add_streamable_http_with_custom_env_var() -> Result<()> {
 #[tokio::test]
 async fn add_streamable_http_rejects_removed_flag() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args([
             "mcp",
@@ -203,8 +261,9 @@ async fn add_streamable_http_rejects_removed_flag() -> Result<()> {
 #[tokio::test]
 async fn add_cant_add_command_and_url() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let managed_config = ManagedConfigGuard::new(codex_home.path())?;
 
-    let mut add_cmd = codex_command(codex_home.path())?;
+    let mut add_cmd = codex_command(codex_home.path(), managed_config.path())?;
     add_cmd
         .args([
             "mcp",
