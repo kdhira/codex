@@ -387,6 +387,78 @@ tool_timeout_sec = 30
 enabled = false
 ```
 
+### Managed MCP overlays
+
+Codex merges MCP servers from multiple layers in precedence order:
+
+1. The local `~/.codex/config.toml` file (user-owned).
+2. `managed_config.toml` (typically delivered via `/etc/codex` or MDM tooling).
+3. A macOS managed-preferences payload.
+
+Each entry remembers where it came from. The CLI only writes to the user layer,
+while the runtime keeps managed entries read-only.
+
+#### Feature flags
+
+Administrators can disable entire layers by setting booleans under `[managed]`
+in any managed overlay. When omitted, both flags default to `true`.
+
+```toml
+[managed]
+enable_mcp_servers = true          # Disable centrally managed entries when false
+enable_user_mcp_servers = true     # Hide user entries and block add/remove when false
+```
+
+- When `enable_user_mcp_servers = false`, `codex mcp add` and `codex mcp remove`
+  refuse to run and explain that policy disables user-defined servers.
+- When `enable_mcp_servers = false` but the managed layer still defines
+  servers, Codex fails closed during startup so the policy violation is visible.
+
+#### Transport policy (`managed.mcp_policy`)
+
+Managed overlays can also enforce allow/deny rules on MCP transports. Rules are
+evaluated in the order they appear.
+
+```toml
+[managed.mcp_policy]
+default_action = "allow"  # optional
+
+[[managed.mcp_policy.http]]
+name = "allow-internal"
+action = "allow"
+url_prefix = "https://mcp.internal.example.com/"
+requires_bearer_token = true
+
+[[managed.mcp_policy.http]]
+name = "block-legacy"
+action = "deny"
+url_prefix = "https://legacy-tools.example.com/"
+
+[[managed.mcp_policy.stdio]]
+name = "allow-tool"
+action = "allow"
+command_prefix = "/usr/local/bin/tool"
+```
+
+- `default_action` controls what happens when no rule matches (`"allow"` by
+  default).
+- HTTP rules match by prefix; setting `requires_bearer_token = true` forces the
+  entry to supply `bearer_token_env_var`.
+- STDIO rules match on the command string.
+
+User entries that violate policy are filtered out and reported by `codex mcp
+list`/`codex mcp get`. Managed entries that violate policy cause the load to
+fail with a descriptive error so administrators can correct the overlay.
+
+#### CLI behaviour
+
+- `codex mcp list` shows a `Source` column (`user`, `managed`, or
+  `managed-preferences`) and prints a "Filtered MCP servers" summary for any
+  entries removed by policy or feature flags.
+- `codex mcp get` surfaces the same provenance information.
+- Attempts to modify a managed entry result in an informative message instead
+  of silently overwriting the managed layer.
+
 ### Experimental RMCP client
 
 Codex is transitioning to the [official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk).
