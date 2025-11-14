@@ -180,7 +180,6 @@ pub enum McpPolicyAction {
     Deny,
 }
 
-
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 struct ManagedConfigSectionToml {
     #[serde(default)]

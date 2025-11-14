@@ -53,6 +53,7 @@ mod imp {
     use crossterm::style::Color as CrosstermColor;
     use crossterm::style::query_background_color;
     use crossterm::style::query_foreground_color;
+    use std::io::IsTerminal as _;
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
@@ -92,12 +93,18 @@ mod imp {
     }
 
     pub(super) fn default_colors() -> Option<DefaultColors> {
+        if !terminal_color_query_supported() {
+            return None;
+        }
         let cache = default_colors_cache();
         let mut cache = cache.lock().ok()?;
         cache.get_or_init_with(|| query_default_colors().unwrap_or_default())
     }
 
     pub(super) fn requery_default_colors() {
+        if !terminal_color_query_supported() {
+            return;
+        }
         if let Ok(mut cache) = default_colors_cache().lock() {
             // Don't try to refresh if the cache is already attempted and failed.
             if cache.attempted && cache.value.is_none() {
@@ -105,6 +112,12 @@ mod imp {
             }
             cache.refresh_with(|| query_default_colors().unwrap_or_default());
         }
+    }
+
+    fn terminal_color_query_supported() -> bool {
+        std::io::stdout().is_terminal()
+            && std::io::stdin().is_terminal()
+            && supports_color::on_cached(supports_color::Stream::Stdout).is_some()
     }
 
     fn query_default_colors() -> std::io::Result<Option<DefaultColors>> {
